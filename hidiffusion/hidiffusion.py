@@ -24,6 +24,7 @@ from diffusers.utils.torch_utils import (
 )
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 from diffusers.models import ControlNetModel
+import warnings
 
 diffusers_version = diffusers.__version__
 if diffusers_version < "0.27.0":
@@ -1490,8 +1491,20 @@ def make_diffusers_transformer_block(
                     windows: (num_windows*B, window_size, window_size, C)
                 """
                 B, N, C = x.shape
-                # H, W = int(N**0.5), int(N**0.5)
                 x = x.view(B, H, W, C)
+                if H % 2 != 0 or W % 2 != 0:
+                    warnings.warn(
+                        f"HiDiffusion Warning: The feature size is {(H,W)} and cannot be directly partitioned into windows. We interpolate the size to {(window_size[0]*2, window_size[1]*2)} to enable the window partition. Even though the generation is OK, the image quality would be largely decreased. We sugget removing window attention by setting apply_hidiffusion(pipe, apply_window_attn=False) for better image quality."
+                    )
+                    x = (
+                        F.interpolate(
+                            x.permute(0, 3, 1, 2).contiguous(),
+                            size=(window_size[0] * 2, window_size[1] * 2),
+                            mode="bicubic",
+                        )
+                        .permute(0, 2, 3, 1)
+                        .contiguous()
+                    )
                 if type(shift_size) == list or type(shift_size) == tuple:
                     if shift_size[0] > 0:
                         x = torch.roll(
@@ -1502,14 +1515,7 @@ def make_diffusers_transformer_block(
                         x = torch.roll(
                             x, shifts=(-shift_size, -shift_size), dims=(1, 2)
                         )
-                x = x.view(
-                    B,
-                    H // window_size[0],
-                    window_size[0],
-                    W // window_size[1],
-                    window_size[1],
-                    C,
-                )
+                x = x.view(B, 2, window_size[0], 2, window_size[1], C)
                 windows = (
                     x.permute(0, 1, 3, 2, 4, 5)
                     .contiguous()
@@ -1531,16 +1537,13 @@ def make_diffusers_transformer_block(
                 """
                 B, N, C = windows.shape
                 windows = windows.view(-1, window_size[0], window_size[1], C)
-                B = int(windows.shape[0] / (H * W / window_size[0] / window_size[1]))
-                x = windows.view(
-                    B,
-                    H // window_size[0],
-                    W // window_size[1],
-                    window_size[0],
-                    window_size[1],
-                    -1,
+                B = int(windows.shape[0] / 4)  # 2x2
+                x = windows.view(B, 2, 2, window_size[0], window_size[1], -1)
+                x = (
+                    x.permute(0, 1, 3, 2, 4, 5)
+                    .contiguous()
+                    .view(B, window_size[0] * 2, window_size[1] * 2, -1)
                 )
-                x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
                 if type(shift_size) == list or type(shift_size) == tuple:
                     if shift_size[0] > 0:
                         x = torch.roll(
@@ -1549,6 +1552,16 @@ def make_diffusers_transformer_block(
                 else:
                     if shift_size > 0:
                         x = torch.roll(x, shifts=(shift_size, shift_size), dims=(1, 2))
+                if H % 2 != 0 or W % 2 != 0:
+                    x = (
+                        F.interpolate(
+                            x.permute(0, 3, 1, 2).contiguous(),
+                            size=(H, W),
+                            mode="bicubic",
+                        )
+                        .permute(0, 2, 3, 1)
+                        .contiguous()
+                    )
                 x = x.view(B, H * W, C)
                 return x
 
@@ -1589,9 +1602,12 @@ def make_diffusers_transformer_block(
             rand_num = torch.rand(1)
             B, N, C = hidden_states.shape
             ori_H, ori_W = self.info["size"]
-            downsample_ratio = int(((ori_H * ori_W) // N) ** 0.5)
-            H, W = (ori_H // downsample_ratio, ori_W // downsample_ratio)
-            widow_size = (H // 2, W // 2)
+            downsample_ratio = round(((ori_H * ori_W) / N) ** 0.5)
+            H, W = (
+                math.ceil(ori_H / downsample_ratio),
+                math.ceil(ori_W / downsample_ratio),
+            )
+            widow_size = (math.ceil(H / 2), math.ceil(W / 2))
             if rand_num <= 0.25:
                 shift_size = (0, 0)
             if rand_num > 0.25 and rand_num <= 0.5:
@@ -1603,7 +1619,6 @@ def make_diffusers_transformer_block(
             norm_hidden_states = window_partition(
                 norm_hidden_states, widow_size, shift_size, H, W
             )
-
             # 1. Retrieve lora scale.
             lora_scale = (
                 cross_attention_kwargs.get("scale", 1.0)
@@ -1857,9 +1872,21 @@ def make_diffusers_cross_attn_down_block(
                         and self.timestep >= self.T1_start
                         and self.timestep < self.T1_end
                     ):
-                        hidden_states = F.avg_pool2d(hidden_states, kernel_size=(2, 2))
+                        self.info["upsample_size"] = (
+                            hidden_states.shape[2],
+                            hidden_states.shape[3],
+                        )
+                        hidden_states = F.avg_pool2d(
+                            hidden_states, kernel_size=(2, 2), ceil_mode=True
+                        )
                     elif self.timestep < self.T1:
-                        hidden_states = F.avg_pool2d(hidden_states, kernel_size=(2, 2))
+                        self.info["upsample_size"] = (
+                            hidden_states.shape[2],
+                            hidden_states.shape[3],
+                        )
+                        hidden_states = F.avg_pool2d(
+                            hidden_states, kernel_size=(2, 2), ceil_mode=True
+                        )
                 output_states = output_states + (hidden_states,)
 
             if self.downsamplers is not None:
@@ -2038,22 +2065,17 @@ def make_diffusers_cross_attn_up_block(
                             and self.timestep >= self.T1_start
                             and self.timestep < self.T1_end
                         ):
-                            re_size = (
-                                int(hidden_states.shape[-2] * 2),
-                                int(hidden_states.shape[-1] * 2),
-                            )
                             hidden_states = F.interpolate(
-                                hidden_states, size=re_size, mode="bicubic"
+                                hidden_states,
+                                size=self.info["upsample_size"],
+                                mode="bicubic",
                             )
                         elif self.timestep < self.T1:
-                            re_size = (
-                                int(hidden_states.shape[-2] * 2),
-                                int(hidden_states.shape[-1] * 2),
-                            )
                             hidden_states = F.interpolate(
-                                hidden_states, size=re_size, mode="bicubic"
+                                hidden_states,
+                                size=self.info["upsample_size"],
+                                mode="bicubic",
                             )
-
             if self.upsamplers is not None:
                 for upsampler in self.upsamplers:
                     hidden_states = upsampler(hidden_states, upsample_size)
@@ -2257,11 +2279,6 @@ def make_diffusers_upsampler_block(
                 self.T1 = int(aggressive_step / 50 * self.max_timestep)
             else:
                 self.T1 = int(self.max_timestep * self.T1_ratio)
-            if self.timestep < self.T1:
-                if ori_H != hidden_states.shape[2] and ori_W != hidden_states.shape[3]:
-                    hidden_states = F.interpolate(
-                        hidden_states, scale_factor=2.0, mode="bicubic"
-                    )
             self.timestep += 1
             if self.timestep == self.max_timestep:
                 self.timestep = 0
@@ -2345,8 +2362,8 @@ def apply_hidiffusion(
             model.unet.__class__ = make_block_fn(model.unet.__class__)
         diffusion_model = model.unet if hasattr(model, "unet") else model
 
-    # force forward_upsample_size=True, see unet_2d_condition.py in diffusers
-    diffusion_model.num_upsamplers += 2
+    # Hack, avoid non-square problem. See unet_2d_condition.py in diffusers
+    diffusion_model.num_upsamplers += 12
 
     name_or_path = model.name_or_path
     diffusion_model_module_key = []
@@ -2360,6 +2377,7 @@ def apply_hidiffusion(
 
     diffusion_model.info = {
         "size": None,
+        "upsample_size": None,
         "hooks": [],
         "text_to_img_controlnet": hasattr(model, "controlnet"),
         "is_inpainting_task": False,
